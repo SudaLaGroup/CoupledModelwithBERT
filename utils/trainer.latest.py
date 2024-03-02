@@ -1,0 +1,140 @@
+import datetime
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+class Trainer(object):
+    def __init__(self, network, config):
+        self.network = network
+        self.config = config
+        # choose optimizer
+        if config.optimizer == 'sgd':
+            print('Using SGD optimizer...')
+            self.optimizer = optim.SGD(network.parameters(), lr=config.lr)
+        elif config.optimizer == 'adam':
+            print('Using Adam optimizer...')
+            self.optimizer = optim.Adam(network.parameters(), lr=config.lr)
+
+    def lr_decay(self, optimizer, epoch, decay_rate, init_lr):
+        lr = init_lr/(1+decay_rate*epoch)
+        print("Learning rate is set as:", lr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def train(self, data_loaders, data_loaders2, evaluator):
+        # record some parameters
+        max_fmeasure = 0
+        test_precision = 0
+        max_epoch = 0
+        patience = 0
+
+        max_fmeasure2 = 0
+        test_precision2 = 0
+        max_epoch2 = 0
+        patience2 = 0
+
+        train_loader, dev_loader, test_loader = data_loaders
+        train_loader2, dev_loader2, test_loader2 = data_loaders2
+        zero_time = datetime.datetime.now() - datetime.datetime.now()
+
+        start_time = datetime.datetime.now()
+        # begin to train
+        print('start to train the model ')
+        for e in range(self.config.epoch):
+            print('===================================Epoch<%d>===================================' % (e + 1), flush=True)
+            self.network.train()
+            time_start = datetime.datetime.now()
+
+            if self.config.optimizer == 'sgd':
+                self.lr_decay(self.optimizer, e, self.config.decay, self.config.lr)
+               
+            batch_cnt = 0
+            #loss = torch.tensor(0.0, requires_grad=True).cuda()
+            
+            time_forward=zero_time
+            time_backward=zero_time
+            sens=0
+            for batch, batch2 in zip(train_loader, train_loader2):
+                # print('batch[0]: ', batch[0])
+                # print('batch[1]: ', batch[1])
+                # print('batch[2]: ', batch[2])
+                # print('batch[3]: ', batch[3])
+                self.optimizer.zero_grad()
+                t_f_start = datetime.datetime.now()
+                mask, out, targets, _ = self.network.forward_batch(batch, 1)
+                time_forward += datetime.datetime.now() - t_f_start
+                t_f_end = datetime.datetime.now()
+                sens+=len(out)
+                loss, snum = self.network.get_loss(out, targets, mask)
+                loss = loss/snum
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.network.parameters(), 5.0)
+                self.optimizer.step()
+
+                self.optimizer.zero_grad()
+                mask, out, targets, _ = self.network.forward_batch(batch2, 2)
+                loss, snum = self.network.get_loss(out, targets, mask)
+                loss = loss/snum
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.network.parameters(), 5.0)
+                self.optimizer.step()
+            with torch.no_grad():
+                #train_loss, train_p, train_r, train_f = evaluator.eval(self.network, train_loader, 1)
+                #print('train : loss = %.4f  precision = %.4f  recall = %.4f  fmeasure = %.4f' % (train_loss, train_p, train_r, train_f))
+
+                dev_loss, dev_p, dev_r, dev_f = evaluator.eval(self.network, dev_loader, 1)
+                print('dev   : loss = %.4f  precision = %.4f  recall = %.4f  fmeasure = %.4f' % (dev_loss, dev_p, dev_r, dev_f))
+
+                test_loss, test_p, test_r, test_f = evaluator.eval(self.network, test_loader, 1)
+                print('test  : loss = %.4f  precision = %.4f  recall = %.4f  fmeasure = %.4f' % (test_loss, test_p, test_r, test_f))
+                
+                #train_loss2, train_p2, train_r2, train_f2 = evaluator.eval(self.network, train_loader2, 2)
+                #print('train2 : loss = %.4f  precision = %.4f  recall = %.4f  fmeasure = %.4f' % (train_loss2, train_p2, train_r2, train_f2))
+
+                dev_loss2, dev_p2, dev_r2, dev_f2 = evaluator.eval(self.network, dev_loader2, 2)
+                print('dev2   : loss = %.4f  precision = %.4f  recall = %.4f  fmeasure = %.4f' % (dev_loss2, dev_p2, dev_r2, dev_f2))
+
+                test_loss2, test_p2, test_r2, test_f2 = evaluator.eval(self.network, test_loader2, 2)
+                print('test2  : loss = %.4f  precision = %.4f  recall = %.4f  fmeasure = %.4f' % (test_loss2, test_p2, test_r2, test_f2))
+                
+            # save the model when dev precision get better
+            if dev_f > max_fmeasure:
+                max_fmeasure = dev_f
+                test_precision = test_f
+                max_epoch = e + 1
+                patience = 0
+                print('save the model1...')
+                torch.save(self.network, self.config.net_file1)
+            else:
+                patience += 1
+
+            if dev_f2 > max_fmeasure2:
+                max_fmeasure2 = dev_f2
+                test_precision2 = test_f2
+                max_epoch2 = e + 1
+                patience2 = 0
+                print('save the model2...')
+                torch.save(self.network, self.config.net_file2)
+            else:
+                patience2 += 1
+            #print('train forward time is ' + str(time_forward) + '\n')
+            #print('train backward time is ' + str(time_backward) + '\n')
+            time_end = datetime.datetime.now()
+            itera_time = time_end - time_start
+            print('iter executing time is ' + str(itera_time) + '\n')
+            print('deal sentence nums is ' + str(sens) + '\n')
+            if patience > self.config.patience and patience2 > self.config.patience:
+                break
+
+        print('train finished with epoch: %d / %d' % (e + 1, self.config.epoch))
+        print('best epoch is epoch = %d ,the dev fmeasure = %.4f the test fmeasure = %.4f' %
+            (max_epoch, max_fmeasure, test_precision))
+        print('train2 finished with epoch: %d / %d' % (e + 1, self.config.epoch))
+        print('best epoch is epoch = %d ,the dev2 fmeasure = %.4f the test2 fmeasure = %.4f' %
+            (max_epoch2, max_fmeasure2, test_precision2))
+        end_time = datetime.datetime.now()
+        print(str(end_time))
+        print('average epoch time:', (end_time - start_time) / (e + 1))

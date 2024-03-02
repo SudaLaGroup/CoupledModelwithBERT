@@ -1,0 +1,223 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+class Metric(object):
+    
+    def is_continue_label(self, label, startlabel, distance):
+        if distance == 0:
+            return True
+        if startlabel[0] == "S" or startlabel[0] == "s" or self.is_start_label(label) or label[2:] != startlabel[2:]:
+            return False
+        return True
+
+    def is_start_label(self, label):
+        return (label[0] == "B" or label[0] == "S" or label[0] == "b" or label[0] == "s")
+
+    def eval(self, predict, target):
+        preds, golds = [], []
+        length = len(predict)
+        
+        for idx in range(length):
+            if self.is_start_label(predict[idx]):
+                s = ""
+                for idy in range(idx, length):
+                    if not self.is_continue_label(predict[idy], predict[idx], idy - idx):
+                        endpos = idy - 1
+                        break
+                    endpos = idy
+                    s += predict[idy][0]
+                ss = "[" + str(idx) + "," + str(endpos) + "]"
+                preds.append(s + predict[idx][1:] + ss)
+                
+        for idx in range(length):
+            if self.is_start_label(target[idx]):
+                s = ""
+                for idy in range(idx, length):
+                    if not self.is_continue_label(target[idy], target[idx], idy - idx):
+                        endpos = idy - 1
+                        break
+                    endpos = idy
+                    s += target[idy][0]
+                ss = "[" + str(idx) + "," + str(endpos) + "]"
+                golds.append(s + target[idx][1:] + ss)
+        overall_count = len(golds)
+        predict_count = len(preds)
+        correct_count = 0
+        for pred in preds:
+            if pred in golds:
+                correct_count += 1
+                
+        return overall_count, predict_count, correct_count
+
+class Decoder(object):
+    
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.illegal_bies = {'B_B', 'B_S', 'S_I', 'S_E', 'I_B', 'I_S', 'E_I', 'E_E'}
+        self.continuous_bies = {'B_I', 'B_E', 'I_I', 'I_E'}
+    
+    # 判断分词联合词性的前后单侧标签是否合法
+    def is_legal_label(self, label, pre_label):
+        ws_label = pre_label[0] + '_' + label[0]
+        if ws_label in self.illegal_bies:
+            return False
+        elif ws_label in self.continuous_bies: # 同一个词里的每一个字符词性需要一致
+            if pre_label[1:] != label[1:]:
+                return False
+            else:
+                return True
+        else:
+            return True
+    # # 判断分词联合词性的前后耦合标签是否合法
+    '''def is_legal_coupled_label(self, label, pre_label):
+        label1, label2 = label.split('@')
+        pre_label1, pre_label2 = pre_label.split('@')
+        return (self.is_legal_label(label1, pre_label1) and self.is_legal_label(label2, pre_label2))'''
+    
+    # 在所有标签中找出所有当前耦合标签后的合法耦合标签集合
+    '''def find_post_legal_labels(self, pre_label):
+        legal_labels1 = set()
+        legal_labels2 = set()
+        legal_labels = set()
+        pre_label1, pre_label2 = pre_label.split('@')
+        for label1 in self.vocab._labels1:
+            if self.is_legal_label(label1, pre_label1):
+                legal_labels1.add(label1)
+        for label2 in self.vocab._labels2:
+            if self.is_legal_label(label2, pre_label2):
+                legal_labels2.add(label2)
+        for labels1 in legal_labels1:
+            for labels2 in legal_labels2:
+                legal_labels.add('@'.join((labels1, labels2)))
+        legal_index = [self.vocab._label2id.get(label, -1) for label in legal_labels]
+        return list(filter(lambda x : x!=-1, legal_index))'''
+    
+    def constrained_decoding(self, out, dataIndex):
+        sen_len, labels_num = out.size()
+        max_predicts = torch.max(out, 1)[1].tolist()
+        sorted_index = torch.sort(out, 1, descending=True)[1].tolist()
+        labels = self.vocab.id2label(max_predicts, dataIndex)
+        # max_predicts1_str = [pred_str.split("@")[0] for pred_str in coupled_labels]
+        # max_predicts2_str = [pred_str.split("@")[1] for pred_str in coupled_labels]
+        
+        constraint_predicts = [int(max_predicts[0])]
+        for i in range(0, len(labels) - 1):
+            for index in sorted_index[i + 1]:
+                post_label = self.vocab.id2label(int(index), dataIndex)
+                if self.is_legal_label(post_label, labels[i]):
+                    constraint_predicts.append(int(index))
+                    labels[i + 1] = post_label
+                    break
+        return constraint_predicts
+
+        
+class Evaluator(object):
+    def __init__(self, vocab, use_crf=True):
+        self.pred_num = 0
+        self.gold_num = 0
+        self.correct_num = 0
+        self.vocab = vocab
+        self.use_crf = use_crf
+
+    def clear_num(self):
+        self.pred_num = 0
+        self.gold_num = 0 
+        self.correct_num = 0
+
+    def eval(self, network, data_loader, dataIndex, ofile):
+        network.eval()
+        total_loss = 0.0
+        total_num = 0
+        sen_index = 0
+        for batch in data_loader:
+            # mask = torch.arange(y.size(1)) < lens.unsqueeze(-1)
+            # mask = word_idxs.gt(0)
+            # mask, out1, targets = network.forward_batch(batch, 1)
+            # mask, out2, targets = network.forward_batch(batch, 2)
+            mask, out, targets = network.forward_batch(batch, dataIndex)
+            sen_lens = mask.sum(1)
+            batch_size, length, labels_num = out.size()
+            total_num += batch_size
+            # total_num += batch_size * length
+            # print("mask:", mask)
+            # print("sen_lens:", sen_lens)
+
+            # batch_loss = network.get_loss(out, targets, dataIndex)
+            # total_loss += batch_loss
+
+            # predicts = Decoder.viterbi_batch(network.crf, out, mask)
+            # predicts = [torch.max(F.softmax(out_sen, dim = 1), 1)[1] for out_sen in out]
+            
+            # predicts1 = []
+            # for i, out_sen in enumerate(out1):
+            #     pre1 = torch.max(F.softmax(out_sen[:sen_lens[i]], dim = 1), 1)[1]
+            #     predicts1.append(pre1)
+            # predicts2 = []
+            # for i, out_sen in enumerate(out2):
+            #     pre2 = torch.max(F.softmax(out_sen[:sen_lens[i]], dim = 1), 1)[1]
+            #     predicts2.append(pre2)
+                
+            # for pred1, pred2 in zip(predicts1, predicts2):
+            #     for p1, p2 in zip(self.vocab.id2label(pred1.tolist(), 1), self.vocab.id2label(pred2.tolist(), 2)):
+            #         pred_str = ''.join((p1, '@', p2))
+            #         f.write(pred_str)
+            #         f.write('\n')
+            #     f.write('\n')
+            
+            # predicts = []
+            # for i, out_sen in enumerate(out):
+            #     # pre = torch.max(F.softmax(out_sen[:sen_lens[i]], dim = 1), 1)[1]
+            #     pre = Decoder(self.vocab).constrained_decoding(F.softmax(out_sen[:sen_lens[i]], dim = 1), dataIndex)
+            #     predicts.append(pre)
+            
+            predicts = []
+            for i, out_sen in enumerate(out):
+                # pre = torch.max(F.softmax(out_sen[:sen_lens[i]], dim = 1), 1)[1]
+                pre = Decoder(self.vocab).constrained_decoding(F.softmax(out_sen[:sen_lens[i]], dim = 1), dataIndex)
+                predicts.append(pre)
+            '''    
+            predicts2 = []
+            for i, out_sen in enumerate(out2):
+                # pre = torch.max(F.softmax(out_sen[:sen_lens[i]], dim = 1), 1)[1]
+                pre = Decoder(self.vocab).constrained_decoding(F.softmax(out_sen[:sen_lens[i]], dim = 1), 2)
+                predicts2.append(pre)
+            for pred1, pred2 in zip(predicts1, predicts2):
+                for p1, p2 in zip(self.vocab.id2label(pred1, 1), self.vocab.id2label(pred2, 2)):
+                    pred_str = ''.join((p1, '@', p2))
+                    f.write(pred_str)
+                    f.write('\n')
+            '''
+                
+            targets = torch.split(targets[mask], sen_lens.tolist())
+            ''' 
+            predicts = []
+            if dataIndex == 1:
+                predicts = predicts1
+            else:
+                predicts = predicts2 
+            '''        
+            for predict, target in zip(predicts, targets):
+                #predict = predict.tolist()
+                #target = target.tolist()
+                #correct_num = sum((x + addIndex) == y for x,y in zip(predict, target))
+                #self.correct_num += correct_num
+                #self.pred_num += len(predict)
+                #self.gold_num += len(target)
+                assert(len(predict) == len(target))
+                predict_str = self.vocab.id2label(predict, dataIndex)
+                target_str = self.vocab.id2label(target.tolist(), dataIndex)
+                overall_count, predict_count, correct_count = Metric().eval(predict_str, target_str)
+                ofile.write(str(sen_index) + "\t" + str(predict_count) + "\t0\t" + str(round(correct_count*2/(predict_count + overall_count) * 100, 2)) + "\t" + str(round(correct_count*2/(predict_count + overall_count) * 100, 2)) + "\t" + str(overall_count) + "\t" + str(overall_count) + "\t" + str(predict_count) + "\t0\t0\t0\t0\n")
+                sen_index += 1
+                self.correct_num += correct_count
+                self.pred_num += predict_count
+                self.gold_num += overall_count
+
+        precision = self.correct_num / self.pred_num
+        recall = self.correct_num / self.gold_num
+        fmeasure = self.correct_num * 2 / (self.pred_num + self.gold_num)
+        self.clear_num()
+        print("precision= %.4f, recall= %.4f, fmeasure= %.4f" % (precision, recall, fmeasure))
+        return total_loss / total_num, precision, recall, fmeasure
+

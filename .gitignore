@@ -1,0 +1,15 @@
+.idea
+.DS_Store
+*.pyc
+*.pkl
+.vscode
+*.db
+*conll
+*-hwc
+*.pt
+*.log
+*.gz
+oldlog
+pruning
+result
+save*
