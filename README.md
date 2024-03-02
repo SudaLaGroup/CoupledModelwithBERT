@@ -1,4 +1,4 @@
-# POS Tagging for Chinese
+# Conversion Model for Chinese
 
 Model : CharLSTM + LSTM + CRF
 
